@@ -25,6 +25,26 @@ def get_actual_header(soup):
             return headers
     return []
 
+def get_last_scraped_game(base_dir):
+    # Check the existing directories to find the last scraped game
+    if not os.path.exists(base_dir):
+        return 1, None  # Default to Week 1, no games scraped yet
+
+    weeks = sorted([d for d in os.listdir(base_dir) if os.path.isdir(os.path.join(base_dir, d))], reverse=True)
+    if not weeks:
+        return 1, None
+
+    last_week = weeks[0]
+    week_number = int(last_week.replace('Week ', ''))
+
+    games = sorted([d for d in os.listdir(os.path.join(base_dir, last_week)) if os.path.isdir(os.path.join(base_dir, last_week, d))], reverse=True)
+    if not games:
+        return week_number, None
+
+    last_game = games[0]
+
+    return week_number, last_game
+
 # Path to ChromeDriver (update this based on where your chromedriver is located)
 CHROME_DRIVER_PATH = './chromedriver.exe'
 
@@ -89,36 +109,17 @@ def read_html_table(table):
     return pd.read_html(StringIO(html_string))[0]
 
 def clean_data(df):
-    # Remove rows with class 'over_header' or 'thead' after the first instance
-    first_header_found = False
+    # Define keywords that indicate the row should be removed (unwanted headers)
+    keywords_to_remove = ['Scoring', 'Punting', 'Player', 'Passing', 'Receiving', 'Kick Returns', 'Punt Returns', 'Fumbles']
 
-    def filter_unwanted_rows(row):
-        nonlocal first_header_found
-        # If 'over_header' or 'thead' classes are found in this row
-        if any('over_header' in str(item) for item in row) or any('thead' in str(item) for item in row):
-            # Skip any additional headers after the first one
-            if first_header_found:
-                return False
-            else:
-                first_header_found = True
-                return True
-        return True
-
-    # Apply the filter to remove unwanted rows
-    df = df[df.apply(filter_unwanted_rows, axis=1)]
-
-    # Try to locate the real header (if any) and reset the index after removing over-header rows
-    try:
-        first_thead_index = df.index[df.apply(lambda row: any('thead' in str(item) for item in row), axis=1)][0]
-        df = df.iloc[first_thead_index + 1:]
-    except IndexError:
-        print("No 'thead' row found, keeping the original data.")
+    # Filter out any rows that contain any of these keywords in any cell
+    df = df[~df.apply(lambda row: row.astype(str).str.contains('|'.join(keywords_to_remove), case=False, na=False).any(), axis=1)]
     
-    df = df.reset_index(drop=True)
+    # Drop fully empty rows
+    df = df.dropna(how='all')
 
-    # Flatten multi-level columns if they exist
-    if isinstance(df.columns, pd.MultiIndex):
-        df.columns = ['_'.join(col).strip() for col in df.columns.values]
+    # Reset index after filtering
+    df = df.reset_index(drop=True)
 
     return df
 
@@ -131,23 +132,35 @@ soup = BeautifulSoup(driver.page_source, 'html.parser')
 schedule_table = soup.find('table', {'id': 'games'})
 rows = schedule_table.find_all('tr')
 
-# Loop through each game row
+# Determine where to start scraping from
+base_dir = 'Game Stats'
+last_week, last_game = get_last_scraped_game(base_dir)
+
+if last_game is None:
+    last_game = 'A'
+
+games_scraped = 0
+scraping_started = False
+
 for game_row in rows:
-    boxscore_td = game_row.find('td', attrs={'data-stat': 'boxscore_word'})
-    
-    # Continue only if the game has 'boxscore' as its boxscore_word, and not 'preview'
-    if boxscore_td and boxscore_td.text.strip() == 'boxscore':
+    if game_row.find('td', attrs={'data-stat': 'boxscore_word'}):
         week_th = game_row.find('th', attrs={'data-stat': 'week_num'})  
         winner_td = game_row.find('td', attrs={'data-stat': 'winner'})
         loser_td = game_row.find('td', attrs={'data-stat': 'loser'})
         
-        week_number = week_th.text.strip() if week_th else 'Unknown_Week'
+        week_number = int(week_th.text.strip()) if week_th else 1
         winner_abbr = winner_td.text.strip() if winner_td else 'Unknown_Winner'
         loser_abbr = loser_td.text.strip() if loser_td else 'Unknown_Loser'
         
         winner = team_name_mapping.get(winner_abbr, winner_abbr)
-        loser = team_name_mapping.get(loser_abbr, loser_abbr)
+        loser = team_name_mapping.get(loser_abbr, loser_abbr)        
         
+        # Skip games already scraped
+        if week_number < last_week or (week_number == last_week and f'{winner} vs {loser}' <= last_game):        
+            continue
+        
+        scraping_started = True
+        boxscore_td = game_row.find('td', attrs={'data-stat': 'boxscore_word'})
         boxscore_link = boxscore_td.find('a')['href']
         game_url = f"https://www.pro-football-reference.com{boxscore_link}"
 
@@ -158,7 +171,6 @@ for game_row in rows:
 
         table_names = ['scoring', 'game_info', 'expected_points', 'team_stats', 'player_offense', 'player_defense', 'returns', 'kicking', 'passing_advanced', 'rushing_advanced', 'receiving_advanced', 'defense_advanced', 'home_drives', 'away_drives']
         
-        base_dir = 'Game Stats'
         week_dir = os.path.join(base_dir, f'Week {week_number}')
         game_dir = os.path.join(week_dir, f'{winner} vs {loser}')
         os.makedirs(game_dir, exist_ok=True)
@@ -176,11 +188,11 @@ for game_row in rows:
                         headers = get_actual_header(BeautifulSoup(str(table), 'html.parser'))
                         df = read_html_table(table)
 
-                        # Assign correct headers to the DataFrame only if the number of headers matches the number of columns
+                        # Assign correct headers to the DataFrame if they match the columns
                         if headers and len(headers) == df.shape[1]:
                             df.columns = headers
 
-                        # Clean the DataFrame by removing over_header and thead rows
+                        # Clean the DataFrame
                         df = clean_data(df)
 
                         game_tables[table_name] = df
@@ -200,5 +212,6 @@ for game_row in rows:
             df.to_csv(file_path, index=False)
             print(f"Saved {table_name} table to {file_path}")
 
+        games_scraped += 1
+
 driver.quit()
-print(f"Scraping completed for all games with 'boxscore'.")
