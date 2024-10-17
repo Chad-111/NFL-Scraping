@@ -136,8 +136,8 @@ rows = schedule_table.find_all('tr')
 base_dir = 'Game Stats'
 last_week, last_game = get_last_scraped_game(base_dir)
 
-if last_game is None:
-    last_game = 'A'
+if last_game is None: # If no games have been scraped yet
+    last_game = 'A' # Set to a value that will always be less than any game name
 
 games_scraped = 0
 scraping_started = False
